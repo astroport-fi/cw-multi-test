@@ -30,6 +30,7 @@ const DENOM_METADATA: Map<String, DenomMetadata> = Map::new("metadata");
 /// Default namespace for bank module.
 pub const NAMESPACE_BANK: &[u8] = b"bank";
 
+/// Token factory module address.
 pub const TOKEN_FACTORY_MODULE: &str = "wasm1tokenfactory";
 
 /// A message representing privileged actions in bank module.
