@@ -3,9 +3,10 @@ use crate::error::{bail, AnyResult};
 use crate::executor::AppResponse;
 use crate::module::Module;
 use crate::prefixed_storage::{prefixed, prefixed_read};
+use crate::WasmSudo;
 use cosmwasm_std::{
     coin, to_json_binary, Addr, AllBalanceResponse, Api, BalanceResponse, BankMsg, BankQuery,
-    Binary, BlockInfo, Coin, Event, Querier, Storage,
+    Binary, BlockInfo, Coin, CustomQuery, Event, Querier, Storage,
 };
 #[cfg(feature = "cosmwasm_1_3")]
 use cosmwasm_std::{AllDenomMetadataResponse, DenomMetadata, DenomMetadataResponse};
@@ -15,6 +16,9 @@ use cw_storage_plus::Map;
 use cw_utils::NativeBalance;
 use itertools::Itertools;
 use schemars::JsonSchema;
+use serde::Serialize;
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 /// Collection of bank balances.
 const BALANCES: Map<&Addr, NativeBalance> = Map::new("balances");
@@ -26,15 +30,34 @@ const DENOM_METADATA: Map<String, DenomMetadata> = Map::new("metadata");
 /// Default namespace for bank module.
 pub const NAMESPACE_BANK: &[u8] = b"bank";
 
+pub const TOKEN_FACTORY_MODULE: &str = "wasm1tokenfactory";
+
 /// A message representing privileged actions in bank module.
 #[derive(Clone, Debug, PartialEq, Eq, JsonSchema)]
 pub enum BankSudo {
-    /// Minting privileged action.
+    /// Mint tokens to the specified address.
     Mint {
-        /// Destination address the tokens will be minted for.
+        /// The recipient
         to_address: String,
-        /// Amount of the minted tokens.
+        /// The coins
         amount: Vec<Coin>,
+    },
+    /// Set hook contract for the specified token.
+    SetHook {
+        /// The token denom
+        denom: String,
+        /// The hook contract address
+        contract_addr: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BankHookMsg {
+    BlockBeforeSend {
+        from: String,
+        to: String,
+        amount: Coin,
     },
 }
 
@@ -51,7 +74,10 @@ pub trait Bank: Module<ExecT = BankMsg, QueryT = BankQuery, SudoT = BankSudo> {}
 /// and account balances. This is particularly important for contracts that deal with financial
 /// operations in the Cosmos ecosystem.
 #[derive(Default)]
-pub struct BankKeeper {}
+pub struct BankKeeper {
+    /// A map of token denoms to hook contract addresses.
+    pub before_send_hooks: RefCell<HashMap<String, String>>,
+}
 
 impl BankKeeper {
     /// Creates a new instance of a bank keeper with default settings.
@@ -182,25 +208,51 @@ impl Module for BankKeeper {
     type QueryT = BankQuery;
     type SudoT = BankSudo;
 
-    fn execute<ExecC, QueryC>(
+    fn execute<ExecC, QueryC: CustomQuery>(
         &self,
-        _api: &dyn Api,
+        api: &dyn Api,
         storage: &mut dyn Storage,
-        _router: &dyn CosmosRouter<ExecC = ExecC, QueryC = QueryC>,
-        _block: &BlockInfo,
+        router: &dyn CosmosRouter<ExecC = ExecC, QueryC = QueryC>,
+        block: &BlockInfo,
         sender: Addr,
         msg: BankMsg,
     ) -> AnyResult<AppResponse> {
-        let mut bank_storage = prefixed(storage, NAMESPACE_BANK);
         match msg {
             BankMsg::Send { to_address, amount } => {
+                // Call hook contract to update the balance
+                let mut events = amount
+                    .iter()
+                    .map(|coin| {
+                        if let Some(hook_contract) =
+                            self.before_send_hooks.borrow().get(&coin.denom)
+                        {
+                            let wasm_sudo = WasmSudo {
+                                contract_addr: Addr::unchecked(hook_contract),
+                                msg: to_json_binary(&BankHookMsg::BlockBeforeSend {
+                                    from: sender.to_string(),
+                                    to: to_address.clone(),
+                                    amount: coin.clone(),
+                                })?,
+                            };
+                            router
+                                .sudo(api, storage, block, wasm_sudo.into())
+                                .map(|r| r.events)
+                        } else {
+                            Ok(vec![])
+                        }
+                    })
+                    .flatten_ok()
+                    .collect::<AnyResult<Vec<_>>>()?;
+
                 // see https://github.com/cosmos/cosmos-sdk/blob/v0.42.7/x/bank/keeper/send.go#L142-L147
-                let events = vec![Event::new("transfer")
-                    .add_attribute("recipient", &to_address)
-                    .add_attribute("sender", &sender)
-                    .add_attribute("amount", coins_to_string(&amount))];
+                events.push(
+                    Event::new("transfer")
+                        .add_attribute("recipient", &to_address)
+                        .add_attribute("sender", &sender)
+                        .add_attribute("amount", coins_to_string(&amount)),
+                );
                 self.send(
-                    &mut bank_storage,
+                    &mut prefixed(storage, NAMESPACE_BANK),
                     sender,
                     Addr::unchecked(to_address),
                     amount,
@@ -209,10 +261,40 @@ impl Module for BankKeeper {
             }
             BankMsg::Burn { amount } => {
                 // burn doesn't seem to emit any events
-                self.burn(&mut bank_storage, sender, amount)?;
-                Ok(AppResponse::default())
+                self.burn(
+                    &mut prefixed(storage, NAMESPACE_BANK),
+                    sender.clone(),
+                    amount.clone(),
+                )?;
+
+                // Call hook contract to update the balance
+                let events = amount
+                    .iter()
+                    .map(|coin| {
+                        if let Some(hook_contract) =
+                            self.before_send_hooks.borrow().get(&coin.denom)
+                        {
+                            let wasm_sudo = WasmSudo {
+                                contract_addr: Addr::unchecked(hook_contract),
+                                msg: to_json_binary(&BankHookMsg::BlockBeforeSend {
+                                    from: sender.to_string(),
+                                    to: TOKEN_FACTORY_MODULE.to_string(),
+                                    amount: coin.clone(),
+                                })?,
+                            };
+                            router
+                                .sudo(api, storage, block, wasm_sudo.into())
+                                .map(|r| r.events)
+                        } else {
+                            Ok(vec![])
+                        }
+                    })
+                    .flatten_ok()
+                    .collect::<AnyResult<Vec<_>>>()?;
+
+                Ok(AppResponse { events, data: None })
             }
-            other => unimplemented!("bank message: {other:?}"),
+            m => bail!("Unsupported bank message: {:?}", m),
         }
     }
 
@@ -267,19 +349,54 @@ impl Module for BankKeeper {
         }
     }
 
-    fn sudo<ExecC, QueryC>(
+    fn sudo<ExecC, QueryC: CustomQuery>(
         &self,
         api: &dyn Api,
         storage: &mut dyn Storage,
-        _router: &dyn CosmosRouter<ExecC = ExecC, QueryC = QueryC>,
-        _block: &BlockInfo,
+        router: &dyn CosmosRouter<ExecC = ExecC, QueryC = QueryC>,
+        block: &BlockInfo,
         msg: BankSudo,
     ) -> AnyResult<AppResponse> {
         let mut bank_storage = prefixed(storage, NAMESPACE_BANK);
         match msg {
             BankSudo::Mint { to_address, amount } => {
                 let to_address = api.addr_validate(&to_address)?;
-                self.mint(&mut bank_storage, to_address, amount)?;
+                self.mint(&mut bank_storage, to_address.clone(), amount.clone())?;
+
+                // Call hook contract to update the balance
+                let events = amount
+                    .iter()
+                    .map(|coin| {
+                        if let Some(hook_contract) =
+                            self.before_send_hooks.borrow().get(&coin.denom)
+                        {
+                            let wasm_sudo = WasmSudo {
+                                contract_addr: Addr::unchecked(hook_contract),
+                                msg: to_json_binary(&BankHookMsg::BlockBeforeSend {
+                                    from: TOKEN_FACTORY_MODULE.to_string(),
+                                    to: to_address.to_string(),
+                                    amount: coin.clone(),
+                                })?,
+                            };
+                            router
+                                .sudo(api, storage, block, wasm_sudo.into())
+                                .map(|r| r.events)
+                        } else {
+                            Ok(vec![])
+                        }
+                    })
+                    .flatten_ok()
+                    .collect::<AnyResult<Vec<_>>>()?;
+
+                Ok(AppResponse { events, data: None })
+            }
+            BankSudo::SetHook {
+                denom,
+                contract_addr,
+            } => {
+                self.before_send_hooks
+                    .borrow_mut()
+                    .insert(denom, contract_addr);
                 Ok(AppResponse::default())
             }
         }
@@ -288,11 +405,12 @@ impl Module for BankKeeper {
 
 #[cfg(test)]
 mod test {
-    use super::*;
-
-    use crate::app::MockRouter;
     use cosmwasm_std::testing::{mock_env, MockApi, MockQuerier, MockStorage};
     use cosmwasm_std::{coins, from_json, Empty, StdError};
+
+    use crate::app::MockRouter;
+
+    use super::*;
 
     fn query_balance(
         bank: &BankKeeper,
