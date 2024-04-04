@@ -6,7 +6,7 @@ use crate::prefixed_storage::{prefixed, prefixed_read};
 use crate::WasmSudo;
 use cosmwasm_std::{
     coin, to_json_binary, Addr, AllBalanceResponse, Api, BalanceResponse, BankMsg, BankQuery,
-    Binary, BlockInfo, Coin, CustomQuery, Event, Querier, Storage,
+    Binary, BlockInfo, Coin, CustomMsg, CustomQuery, Event, Querier, Storage,
 };
 #[cfg(feature = "cosmwasm_1_3")]
 use cosmwasm_std::{AllDenomMetadataResponse, DenomMetadata, DenomMetadataResponse};
@@ -209,7 +209,7 @@ impl Module for BankKeeper {
     type QueryT = BankQuery;
     type SudoT = BankSudo;
 
-    fn execute<ExecC, QueryC: CustomQuery>(
+    fn execute<ExecC: CustomMsg, QueryC: CustomQuery>(
         &self,
         api: &dyn Api,
         storage: &mut dyn Storage,
@@ -229,7 +229,7 @@ impl Module for BankKeeper {
                         {
                             let wasm_sudo = WasmSudo {
                                 contract_addr: Addr::unchecked(hook_contract),
-                                msg: to_json_binary(&BankHookMsg::BlockBeforeSend {
+                                message: to_json_binary(&BankHookMsg::BlockBeforeSend {
                                     from: sender.to_string(),
                                     to: to_address.clone(),
                                     amount: coin.clone(),
@@ -277,7 +277,7 @@ impl Module for BankKeeper {
                         {
                             let wasm_sudo = WasmSudo {
                                 contract_addr: Addr::unchecked(hook_contract),
-                                msg: to_json_binary(&BankHookMsg::BlockBeforeSend {
+                                message: to_json_binary(&BankHookMsg::BlockBeforeSend {
                                     from: sender.to_string(),
                                     to: TOKEN_FACTORY_MODULE.to_string(),
                                     amount: coin.clone(),
@@ -350,7 +350,7 @@ impl Module for BankKeeper {
         }
     }
 
-    fn sudo<ExecC, QueryC: CustomQuery>(
+    fn sudo<ExecC: CustomMsg, QueryC: CustomQuery>(
         &self,
         api: &dyn Api,
         storage: &mut dyn Storage,
@@ -373,7 +373,7 @@ impl Module for BankKeeper {
                         {
                             let wasm_sudo = WasmSudo {
                                 contract_addr: Addr::unchecked(hook_contract),
-                                msg: to_json_binary(&BankHookMsg::BlockBeforeSend {
+                                message: to_json_binary(&BankHookMsg::BlockBeforeSend {
                                     from: TOKEN_FACTORY_MODULE.to_string(),
                                     to: to_address.to_string(),
                                     amount: coin.clone(),
