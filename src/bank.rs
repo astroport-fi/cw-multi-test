@@ -149,15 +149,43 @@ impl BankKeeper {
         Ok(coin(supply.into(), denom))
     }
 
-    fn send(
+    fn send<ExecC, QueryC: CustomQuery>(
         &self,
-        bank_storage: &mut dyn Storage,
+        api: &dyn Api,
+        storage: &mut dyn Storage,
+        router: &dyn CosmosRouter<ExecC = ExecC, QueryC = QueryC>,
+        block: &BlockInfo,
         from_address: Addr,
         to_address: Addr,
         amount: Vec<Coin>,
-    ) -> AnyResult<()> {
-        self.burn(bank_storage, from_address, amount.clone())?;
-        self.mint(bank_storage, to_address, amount)
+    ) -> AnyResult<Vec<Event>> {
+        let events = amount
+            .iter()
+            .map(|coin| {
+                if let Some(hook_contract) = self.before_send_hooks.borrow().get(&coin.denom) {
+                    let wasm_sudo = WasmSudo {
+                        contract_addr: Addr::unchecked(hook_contract),
+                        msg: to_json_binary(&BankHookMsg::BlockBeforeSend {
+                            from: from_address.to_string(),
+                            to: to_address.to_string(),
+                            amount: coin.clone(),
+                        })?,
+                    };
+                    router
+                        .sudo(api, storage, block, wasm_sudo.into())
+                        .map(|r| r.events)
+                } else {
+                    Ok(vec![])
+                }
+            })
+            .flatten_ok()
+            .collect::<AnyResult<Vec<_>>>()?;
+
+        let mut bank_storage = prefixed(storage, NAMESPACE_BANK);
+        self.burn(&mut bank_storage, from_address, amount.clone())?;
+        self.mint(&mut bank_storage, to_address, amount)?;
+
+        Ok(events)
     }
 
     fn mint(
@@ -220,30 +248,15 @@ impl Module for BankKeeper {
     ) -> AnyResult<AppResponse> {
         match msg {
             BankMsg::Send { to_address, amount } => {
-                // Call hook contract to update the balance
-                let mut events = amount
-                    .iter()
-                    .map(|coin| {
-                        if let Some(hook_contract) =
-                            self.before_send_hooks.borrow().get(&coin.denom)
-                        {
-                            let wasm_sudo = WasmSudo {
-                                contract_addr: Addr::unchecked(hook_contract),
-                                msg: to_json_binary(&BankHookMsg::BlockBeforeSend {
-                                    from: sender.to_string(),
-                                    to: to_address.clone(),
-                                    amount: coin.clone(),
-                                })?,
-                            };
-                            router
-                                .sudo(api, storage, block, wasm_sudo.into())
-                                .map(|r| r.events)
-                        } else {
-                            Ok(vec![])
-                        }
-                    })
-                    .flatten_ok()
-                    .collect::<AnyResult<Vec<_>>>()?;
+                let mut events = self.send(
+                    api,
+                    storage,
+                    router,
+                    block,
+                    sender.clone(),
+                    Addr::unchecked(&to_address),
+                    amount.clone(),
+                )?;
 
                 // see https://github.com/cosmos/cosmos-sdk/blob/v0.42.7/x/bank/keeper/send.go#L142-L147
                 events.push(
@@ -252,46 +265,27 @@ impl Module for BankKeeper {
                         .add_attribute("sender", &sender)
                         .add_attribute("amount", coins_to_string(&amount)),
                 );
-                self.send(
-                    &mut prefixed(storage, NAMESPACE_BANK),
-                    sender,
-                    Addr::unchecked(to_address),
-                    amount,
-                )?;
+
                 Ok(AppResponse { events, data: None })
             }
             BankMsg::Burn { amount } => {
-                // burn doesn't seem to emit any events
-                self.burn(
-                    &mut prefixed(storage, NAMESPACE_BANK),
+                let token_factory_addr = Addr::unchecked(TOKEN_FACTORY_MODULE);
+                let events = self.send(
+                    api,
+                    storage,
+                    router,
+                    block,
                     sender.clone(),
+                    token_factory_addr.clone(),
                     amount.clone(),
                 )?;
 
-                // Call hook contract to update the balance
-                let events = amount
-                    .iter()
-                    .map(|coin| {
-                        if let Some(hook_contract) =
-                            self.before_send_hooks.borrow().get(&coin.denom)
-                        {
-                            let wasm_sudo = WasmSudo {
-                                contract_addr: Addr::unchecked(hook_contract),
-                                msg: to_json_binary(&BankHookMsg::BlockBeforeSend {
-                                    from: sender.to_string(),
-                                    to: TOKEN_FACTORY_MODULE.to_string(),
-                                    amount: coin.clone(),
-                                })?,
-                            };
-                            router
-                                .sudo(api, storage, block, wasm_sudo.into())
-                                .map(|r| r.events)
-                        } else {
-                            Ok(vec![])
-                        }
-                    })
-                    .flatten_ok()
-                    .collect::<AnyResult<Vec<_>>>()?;
+                // burn doesn't seem to emit any events
+                self.burn(
+                    &mut prefixed(storage, NAMESPACE_BANK),
+                    token_factory_addr,
+                    amount.clone(),
+                )?;
 
                 Ok(AppResponse { events, data: None })
             }
@@ -358,36 +352,24 @@ impl Module for BankKeeper {
         block: &BlockInfo,
         msg: BankSudo,
     ) -> AnyResult<AppResponse> {
-        let mut bank_storage = prefixed(storage, NAMESPACE_BANK);
         match msg {
             BankSudo::Mint { to_address, amount } => {
-                let to_address = api.addr_validate(&to_address)?;
-                self.mint(&mut bank_storage, to_address.clone(), amount.clone())?;
+                let token_factory_addr = Addr::unchecked(TOKEN_FACTORY_MODULE);
+                self.mint(
+                    &mut prefixed(storage, NAMESPACE_BANK),
+                    token_factory_addr.clone(),
+                    amount.clone(),
+                )?;
 
-                // Call hook contract to update the balance
-                let events = amount
-                    .iter()
-                    .map(|coin| {
-                        if let Some(hook_contract) =
-                            self.before_send_hooks.borrow().get(&coin.denom)
-                        {
-                            let wasm_sudo = WasmSudo {
-                                contract_addr: Addr::unchecked(hook_contract),
-                                msg: to_json_binary(&BankHookMsg::BlockBeforeSend {
-                                    from: TOKEN_FACTORY_MODULE.to_string(),
-                                    to: to_address.to_string(),
-                                    amount: coin.clone(),
-                                })?,
-                            };
-                            router
-                                .sudo(api, storage, block, wasm_sudo.into())
-                                .map(|r| r.events)
-                        } else {
-                            Ok(vec![])
-                        }
-                    })
-                    .flatten_ok()
-                    .collect::<AnyResult<Vec<_>>>()?;
+                let events = self.send(
+                    api,
+                    storage,
+                    router,
+                    block,
+                    token_factory_addr,
+                    api.addr_validate(&to_address)?,
+                    amount.clone(),
+                )?;
 
                 Ok(AppResponse { events, data: None })
             }
